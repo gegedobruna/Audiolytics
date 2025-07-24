@@ -1,6 +1,13 @@
-venv/
+# Ignore secrets
+.env
+
+# Ignore saved data
+data/
+*.csv
+
+# Ignore Python noise
 __pycache__/
 *.pyc
-*.csv
-.DS_Store
 
+# Ignore virtual environment
+venv/
