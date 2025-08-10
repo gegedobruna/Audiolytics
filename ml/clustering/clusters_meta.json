@@ -1,0 +1,42 @@
+{
+  "chosen_k": 10,
+  "chosen_silhouette": 0.15369489096808894,
+  "grid": [
+    {
+      "k": 10,
+      "silhouette": 0.15369489096808894,
+      "inertia": 399186.9127458284
+    },
+    {
+      "k": 14,
+      "silhouette": 0.15268627742359883,
+      "inertia": 352206.54485857626
+    },
+    {
+      "k": 11,
+      "silhouette": 0.15259803490624116,
+      "inertia": 384646.8056194927
+    },
+    {
+      "k": 13,
+      "silhouette": 0.14621985232835327,
+      "inertia": 363919.6473846111
+    },
+    {
+      "k": 12,
+      "silhouette": 0.1427245949497078,
+      "inertia": 374699.0575038866
+    }
+  ],
+  "feature_cols": [
+    "danceability",
+    "energy",
+    "valence",
+    "acousticness",
+    "instrumentalness",
+    "liveness",
+    "speechiness",
+    "tempo",
+    "loudness"
+  ]
+}

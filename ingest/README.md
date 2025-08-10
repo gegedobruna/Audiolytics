@@ -1,4 +1,4 @@
-# Ingestion scripts (optional)
+# Ingestion scripts
 These are the scripts I used to enrich/build the dataset locally.  
 The Streamlit app itself runs from `data/audiolytics.parquet`.
 

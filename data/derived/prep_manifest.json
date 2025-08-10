@@ -1,0 +1,22 @@
+{
+  "input": "C:\\Users\\geged\\OneDrive\\Desktop\\Audiolytics\\data\\Complete_Data.csv",
+  "events_path": "C:\\Users\\geged\\OneDrive\\Desktop\\Audiolytics\\data\\derived\\sequences.parquet",
+  "daily_path": "C:\\Users\\geged\\OneDrive\\Desktop\\Audiolytics\\data\\derived\\daily_counts.parquet",
+  "n_rows": 96888,
+  "n_sessions": 3120,
+  "feature_cols": [
+    "danceability",
+    "energy",
+    "valence",
+    "acousticness",
+    "instrumentalness",
+    "liveness",
+    "speechiness",
+    "tempo",
+    "loudness"
+  ],
+  "timestamp_col": "ts",
+  "artist_col": "master_metadata_album_artist_name",
+  "track_col": "master_metadata_track_name",
+  "session_gap_min": 30
+}
