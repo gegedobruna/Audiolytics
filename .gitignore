@@ -1,13 +1,18 @@
 # Ignore secrets
 .env
 
-# Ignore saved data
-data/
-*.csv
-
 # Ignore Python noise
 __pycache__/
 *.pyc
 
 # Ignore virtual environment
 venv/
+
+
+# caches / artifacts
+*.db
+*.duckdb
+
+# secrets
+.env
+.streamlit/secrets.toml
