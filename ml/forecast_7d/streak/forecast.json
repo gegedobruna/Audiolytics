@@ -1,0 +1,30 @@
+[
+  {
+    "day_ahead": 1,
+    "prob_continue": 0.9735610698674031
+  },
+  {
+    "day_ahead": 2,
+    "prob_continue": 0.9809882162167187
+  },
+  {
+    "day_ahead": 3,
+    "prob_continue": 0.9672603623214356
+  },
+  {
+    "day_ahead": 4,
+    "prob_continue": 0.9741822529519538
+  },
+  {
+    "day_ahead": 5,
+    "prob_continue": 0.955175455156775
+  },
+  {
+    "day_ahead": 6,
+    "prob_continue": 0.9662135849743851
+  },
+  {
+    "day_ahead": 7,
+    "prob_continue": 0.9746859972469492
+  }
+]
