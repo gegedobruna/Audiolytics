@@ -1,0 +1,27 @@
+{
+  "seq_len": 30,
+  "batch_size": 256,
+  "hidden": 128,
+  "layers": 1,
+  "dropout": 0.2,
+  "epochs": 15,
+  "lr": 0.001,
+  "weight_decay": 1e-05,
+  "K": 10,
+  "feature_cols": [
+    "danceability",
+    "energy",
+    "valence",
+    "acousticness",
+    "instrumentalness",
+    "liveness",
+    "speechiness",
+    "tempo",
+    "loudness"
+  ],
+  "splits": {
+    "n_rows": 96888,
+    "train_frac": 0.7,
+    "val_frac": 0.15
+  }
+}
