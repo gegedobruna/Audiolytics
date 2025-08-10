@@ -1,0 +1,6 @@
+{
+  "backtest_horizon": 7,
+  "seasonal_naive_MAE": 55.0,
+  "sarima_MAE": 56.425526076670316,
+  "winner": "SeasonalNaive"
+}
