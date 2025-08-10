@@ -1,0 +1,5 @@
+{
+  "horizon_days": 7,
+  "model": "SeasonalNaive (weekly) + renormalize",
+  "backtest_mae_macro": 0.05657464732180633
+}
