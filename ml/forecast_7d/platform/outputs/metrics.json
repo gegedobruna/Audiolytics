@@ -1,0 +1,20 @@
+{
+  "Windows": {
+    "winner": "SARIMA"
+  },
+  "Android": {
+    "winner": "SeasonalNaive"
+  },
+  "Xbox": {
+    "winner": "SeasonalNaive"
+  },
+  "iOS": {
+    "winner": "SARIMA"
+  },
+  "Other": {
+    "winner": "SARIMA"
+  },
+  "PlayStation": {
+    "winner": "SARIMA"
+  }
+}
