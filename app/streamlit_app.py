@@ -9,6 +9,9 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import MiniBatchKMeans
 import os
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor
+import gc
 
 st.set_page_config(page_title="Audiolytics (Fast+)", layout="wide")
 
@@ -133,50 +136,59 @@ def to_parquet_once() -> str:
     st.error("No input file found. Place 'Complete_Data.csv' next to this app or under ./data/.")
     st.stop()
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=3600)  # Cache for 1 hour
 def load_df() -> pd.DataFrame:
     pq = to_parquet_once()
     df = pd.read_parquet(pq)
     return df
 
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_df_sample(max_rows: int = 100000) -> pd.DataFrame:
+    """Load a sampled version of the data for faster initial loading"""
+    pq = to_parquet_once()
+    df = pd.read_parquet(pq)
+    if len(df) > max_rows:
+        return df.sample(max_rows, random_state=42)
+    return df
+
 # ---------------------- UTIL & PREP ----------------------
 WINDOWS_ALIASES = {"windows","windows desktop","windows 10","win32","windows store","microsoft store","windows phone","windows-10","windows10","win64"}
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=3600)
 def optimize(df: pd.DataFrame) -> pd.DataFrame:
+    """Optimized data preprocessing with better memory management"""
     df = df.copy()
+    
     # Normalize columns
     df.columns = [c.strip() for c in df.columns]
-    # Coerce numerics
+    
+    # Coerce numerics with better memory management
     num_cols = ["ms_played", "acousticness", "danceability", "energy",
                 "instrumentalness", "liveness", "loudness", "speechiness",
                 "tempo", "valence"]
     for c in num_cols:
         if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    # Downcast
-    for c in df.select_dtypes(include=["float", "int"]).columns:
-        df[c] = pd.to_numeric(df[c], downcast="float")
+            df[c] = pd.to_numeric(df[c], errors="coerce", downcast="float")
 
     # Add stable row_id for fast joins
-    df["row_id"] = np.arange(len(df), dtype="int64")
+    df["row_id"] = np.arange(len(df), dtype="int32")  # Use int32 instead of int64
 
-    # Time features
+    # Time features with optimization
     if "ts" in df.columns:
         df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
         df["date"] = df["ts"].dt.date
-        df["year"] = df["ts"].dt.year
+        df["year"] = df["ts"].dt.year.astype("int16")  # Use int16 for years
         df["month"] = df["ts"].dt.to_period("M").astype(str)
-        df["hour"] = df["ts"].dt.hour
+        df["hour"] = df["ts"].dt.hour.astype("int8")  # Use int8 for hours
         df["dow"] = df["ts"].dt.day_name()
 
-    # Categoricals
-    for c in ["master_metadata_album_artist_name","master_metadata_track_name",
-              "platform","conn_country","reason_start","reason_end"]:
+    # Categoricals with memory optimization
+    categorical_cols = ["master_metadata_album_artist_name","master_metadata_track_name",
+                       "platform","conn_country","reason_start","reason_end"]
+    for c in categorical_cols:
         if c in df.columns:
             df[c] = df[c].astype("category")
 
-    
     # Platform normalization (regex grouping → tidy buckets)
     if "platform" in df.columns:
         df["platform"] = df["platform"].astype(str).str.strip()
@@ -186,8 +198,7 @@ def optimize(df: pd.DataFrame) -> pd.DataFrame:
     # Alias for plotting/grouping
     df["platform_group"] = df["platform_norm"]
 
-
-    # Genres list
+    # Genres list with optimization
     if "artist_genres" in df.columns:
         def split_genres(x):
             if pd.isna(x): return []
@@ -197,6 +208,9 @@ def optimize(df: pd.DataFrame) -> pd.DataFrame:
                     return [p.strip() for p in s.split(d) if p.strip()]
             return [s.strip()] if s.strip() else []
         df["artist_genres_list"] = df["artist_genres"].apply(split_genres)
+    
+    # Force garbage collection
+    gc.collect()
     return df
 
 @st.cache_data(show_spinner=False)
@@ -207,23 +221,48 @@ def explode_genres(df: pd.DataFrame) -> pd.DataFrame:
     temp["artist_genres_list"] = temp["artist_genres_list"].apply(tuple)
     return temp.explode("artist_genres_list")
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=3600)
 def build_exploded_all(df: pd.DataFrame) -> pd.DataFrame:
     """Explode FULL dataset once and cache. Returns: row_id, month, artist_genres_list, ms_played."""
     if "artist_genres_list" not in df.columns:
         return df.head(0)
+    
+    # Optimize memory usage by selecting only needed columns and using efficient dtypes
     tmp = df[["row_id","month","artist_genres_list","ms_played"]].copy()
     tmp["artist_genres_list"] = tmp["artist_genres_list"].apply(tuple)
-    exp = tmp.explode("artist_genres_list").dropna(subset=["artist_genres_list"])
+    
+    # Use chunked processing for large datasets
+    if len(tmp) > 100000:
+        chunk_size = 50000
+        chunks = []
+        for i in range(0, len(tmp), chunk_size):
+            chunk = tmp.iloc[i:i+chunk_size].explode("artist_genres_list").dropna(subset=["artist_genres_list"])
+            chunks.append(chunk)
+        exp = pd.concat(chunks, ignore_index=True)
+    else:
+        exp = tmp.explode("artist_genres_list").dropna(subset=["artist_genres_list"])
+    
+    # Optimize dtypes
+    exp["row_id"] = exp["row_id"].astype("int32")
+    exp["ms_played"] = exp["ms_played"].astype("float32")
+    
     return exp
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=1800)  # Cache for 30 minutes
 def get_exploded_for_filter(dff: pd.DataFrame, exploded_all: pd.DataFrame) -> pd.DataFrame:
     """Subset pre-exploded ALL rows to the current filtered rows via row_id."""
     if "row_id" not in dff.columns or exploded_all.empty:
         return dff.head(0)
-    ids = dff["row_id"].astype("int64").unique()
+    
+    # Optimize ID lookup with efficient data types
+    ids = dff["row_id"].astype("int32").unique()
     sub = exploded_all[exploded_all["row_id"].isin(ids)].copy()
+    
+    # Force garbage collection for memory management
+    if enable_gc:
+        del ids
+        gc.collect()
+    
     return sub
 
 @st.cache_data(show_spinner=False)
@@ -360,9 +399,23 @@ def forgotten_tracks(df: pd.DataFrame, top_n_per_month: int = 20, stale_months: 
     return out[["month", tcol, "ms_played", "rank", "first_seen", "last_seen"]].reset_index(drop=True)
 
 # ---------------------- LOAD & PREP ----------------------
-df_raw = load_df()
-df = optimize(df_raw)
-exp_all = build_exploded_all(df)
+# Progressive loading with performance optimization
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_and_prepare_data():
+    """Load and prepare data with progress indicators"""
+    with st.spinner("Loading data..."):
+        df_raw = load_df()
+    
+    with st.spinner("Optimizing data types and preprocessing..."):
+        df = optimize(df_raw)
+    
+    with st.spinner("Building genre explosion cache..."):
+        exp_all = build_exploded_all(df)
+    
+    return df, exp_all
+
+# Load data with progress indicators
+df, exp_all = load_and_prepare_data()
 
 artist_col = "master_metadata_album_artist_name" if "master_metadata_album_artist_name" in df.columns else None
 track_col = "master_metadata_track_name" if "master_metadata_track_name" in df.columns else None
@@ -371,11 +424,18 @@ track_col = "master_metadata_track_name" if "master_metadata_track_name" in df.c
 st.sidebar.header("Filters & Performance")
 fast_mode = st.sidebar.checkbox("⚡ Fast mode (sample for heavy charts)", value=True)
 MAX_ROWS = st.sidebar.number_input("Max rows in Fast mode", min_value=5_000, max_value=200_000, value=30_000, step=5_000)
-run_pca = st.sidebar.checkbox("Enable PCA (can be slow)", value=False)
+
+# Performance optimization settings
+st.sidebar.subheader("Performance Settings")
+lazy_heavy = st.sidebar.checkbox("Lazy compute heavy sections", value=True, help="Heavy charts compute only when you click a button")
+enable_pca = st.sidebar.checkbox("Enable PCA (can be slow)", value=False)
 enable_sessions = st.sidebar.checkbox("Reconstruct & cluster sessions (slow)", value=False)
 k_clusters = st.sidebar.slider("Session clusters (k)", 3, 8, 5)
 
-lazy_heavy = st.sidebar.checkbox("Lazy compute heavy sections", value=True, help="Heavy charts compute only when you click a button")
+# Memory management
+st.sidebar.subheader("Memory Management")
+enable_gc = st.sidebar.checkbox("Force garbage collection", value=True, help="Clear memory after heavy operations")
+max_chart_points = st.sidebar.number_input("Max points per chart", min_value=1000, max_value=100000, value=10000, step=1000)
 
 gap_mins = st.sidebar.slider("Session gap threshold (minutes)", 10, 60, 30, 5)
 
@@ -426,14 +486,20 @@ if selected_countries and "conn_country" in df.columns:
 
 dff = df[mask].copy()
 
-# Decide sampled frame for heavy charts
+# Decide sampled frame for heavy charts with memory optimization
 if fast_mode and len(dff) > MAX_ROWS:
     dff_plot = dff.sample(int(MAX_ROWS), random_state=42)
 else:
     dff_plot = dff
 
-st.title("🎧 Audiolytics — Fast+")
-st.caption("Optimized loading, cached transforms, sampling for heavy charts, and richer insights with explanations.")
+# Additional sampling for very heavy charts
+if len(dff_plot) > max_chart_points:
+    dff_chart = dff_plot.sample(int(max_chart_points), random_state=42)
+else:
+    dff_chart = dff_plot
+
+st.title("🎧 Audiolytics — Ultra Fast")
+st.caption("🚀 **Performance Optimized**: Lazy loading, smart caching, memory management, and progressive computation for lightning-fast dashboard experience.")
 
 # ---------------------- KPIs ----------------------
 c1, c2, c3, c4 = st.columns(4)
@@ -475,62 +541,70 @@ with tabs[1]:
     st.markdown("Shows how **genre shares** shift over months. Each band's thickness is that genre's share of total listening.")
 
     if not lazy_heavy or st.button("Compute Genre Stack / Entropy", key="compute_genres"):
-        exploded = get_exploded_for_filter(dff_plot, exp_all)
-        if exploded.empty:
-            st.info("No genre data in the current filter.")
-        else:
-            g = exploded.groupby(["artist_genres_list","month"], as_index=False)["ms_played"].sum()
-            g["minutes"] = g["ms_played"] / 60000
-
-            area = alt.Chart(g).mark_area(opacity=0.8).encode(
-                x="month:T",
-                y=alt.Y("minutes:Q", stack="normalize", title="Share"),
-                color="artist_genres_list:N",
-                tooltip=["month:T","artist_genres_list:N","minutes:Q"]
-            ).properties(height=320)
-            st.altair_chart(area, use_container_width=True)
-
-            st.subheader("Genre Entropy (Variety)")
-            ent = monthly_genre_entropy(exploded)
-            if not ent.empty:
-                ent_line = alt.Chart(ent).mark_line(point=True).encode(
-                    x="month:T", y=alt.Y("entropy:Q", title="Shannon Entropy"),
-                    tooltip=["month:T","entropy:Q"]
-                ).properties(height=260)
-                st.altair_chart(ent_line, use_container_width=True)
+        with st.spinner("Computing genre analysis..."):
+            exploded = get_exploded_for_filter(dff_plot, exp_all)
+            if exploded.empty:
+                st.info("No genre data in the current filter.")
             else:
-                st.info("Not enough data to compute entropy.")
+                # Optimize data for charts
+                g = exploded.groupby(["artist_genres_list","month"], as_index=False)["ms_played"].sum()
+                g["minutes"] = g["ms_played"] / 60000
 
-            # --- Entry/Exit + Rising/Falling ---
-            st.subheader("Genre Entry & Exit")
-            first_last = (exploded.groupby("artist_genres_list")["month"]
-                          .agg(["min","max","nunique"])
-                          .reset_index()
-                          .rename(columns={"min":"first_month","max":"last_month","nunique":"active_months"}))
-            st.dataframe(first_last.sort_values("first_month").head(200), use_container_width=True)
+                area = alt.Chart(g).mark_area(opacity=0.8).encode(
+                    x="month:T",
+                    y=alt.Y("minutes:Q", stack="normalize", title="Share"),
+                    color="artist_genres_list:N",
+                    tooltip=["month:T","artist_genres_list:N","minutes:Q"]
+                ).properties(height=320)
+                st.altair_chart(area, use_container_width=True)
 
-            st.subheader("Rising vs Falling Genres")
-            gm = (exploded.groupby(["month","artist_genres_list"], as_index=False)["ms_played"].sum()
-                  .assign(minutes=lambda x: x["ms_played"]/60000)
-                  .sort_values(["artist_genres_list","month"]))
-            gm["mom"] = gm.groupby("artist_genres_list")["minutes"].pct_change()
-            latest_month = gm["month"].max()
-            last_slice = gm[gm["month"] == latest_month].dropna(subset=["mom"])
-            top_rising = last_slice.sort_values("mom", ascending=False).head(15)
-            top_falling = last_slice.sort_values("mom", ascending=True).head(15)
+                st.subheader("Genre Entropy (Variety)")
+                ent = monthly_genre_entropy(exploded)
+                if not ent.empty:
+                    ent_line = alt.Chart(ent).mark_line(point=True).encode(
+                        x="month:T", 
+                        y=alt.Y("entropy:Q", title="Shannon Entropy", scale=alt.Scale(domain=[3, None])),
+                        tooltip=["month:T","entropy:Q"]
+                    ).properties(height=260)
+                    st.altair_chart(ent_line, use_container_width=True)
+                else:
+                    st.info("Not enough data to compute entropy.")
 
-            rbar = alt.Chart(top_rising).mark_bar().encode(
-                x=alt.X("mom:Q", title="MoM Growth"),
-                y=alt.Y("artist_genres_list:N", sort="-x"),
-                tooltip=["artist_genres_list","mom:Q"]
-            ).properties(height=280, title=f"Top Rising Genres — {latest_month}")
-            fbar = alt.Chart(top_falling).mark_bar().encode(
-                x=alt.X("mom:Q", title="MoM Growth"),
-                y=alt.Y("artist_genres_list:N", sort="x"),
-                tooltip=["artist_genres_list","mom:Q"]
-            ).properties(height=280, title=f"Top Falling Genres — {latest_month}")
-            st.altair_chart(rbar, use_container_width=True)
-            st.altair_chart(fbar, use_container_width=True)
+                # --- Entry/Exit + Rising/Falling ---
+                st.subheader("Genre Entry & Exit")
+                first_last = (exploded.groupby("artist_genres_list")["month"]
+                              .agg(["min","max","nunique"])
+                              .reset_index()
+                              .rename(columns={"min":"first_month","max":"last_month","nunique":"active_months"}))
+                st.dataframe(first_last.sort_values("first_month").head(200), use_container_width=True)
+
+                st.subheader("Rising vs Falling Genres")
+                gm = (exploded.groupby(["month","artist_genres_list"], as_index=False)["ms_played"].sum()
+                      .assign(minutes=lambda x: x["ms_played"]/60000)
+                      .sort_values(["artist_genres_list","month"]))
+                gm["mom"] = gm.groupby("artist_genres_list")["minutes"].pct_change()
+                latest_month = gm["month"].max()
+                last_slice = gm[gm["month"] == latest_month].dropna(subset=["mom"])
+                top_rising = last_slice.sort_values("mom", ascending=False).head(15)
+                top_falling = last_slice.sort_values("mom", ascending=True).head(15)
+
+                rbar = alt.Chart(top_rising).mark_bar().encode(
+                    x=alt.X("mom:Q", title="MoM Growth"),
+                    y=alt.Y("artist_genres_list:N", sort="-x"),
+                    tooltip=["artist_genres_list","mom:Q"]
+                ).properties(height=280, title=f"Top Rising Genres — {latest_month}")
+                fbar = alt.Chart(top_falling).mark_bar().encode(
+                    x=alt.X("mom:Q", title="MoM Growth"),
+                    y=alt.Y("artist_genres_list:N", sort="x"),
+                    tooltip=["artist_genres_list","mom:Q"]
+                ).properties(height=280, title=f"Top Falling Genres — {latest_month}")
+                st.altair_chart(rbar, use_container_width=True)
+                st.altair_chart(fbar, use_container_width=True)
+                
+                # Memory cleanup
+                if enable_gc:
+                    del exploded, g, ent, first_last, gm, top_rising, top_falling
+                    gc.collect()
     else:
         st.caption("Lazy compute is ON — click the button above to render heavy genre charts.")
 # ---------------------- ARTISTS ----------------------
@@ -620,8 +694,8 @@ with tabs[3]:
         st.markdown("Plot any two features to see **clusters of sound**. In Fast mode we sample to keep things snappy.")
         x = st.selectbox("X", feats, index=1 if len(feats)>1 else 0)
         y = st.selectbox("Y", feats, index=2 if len(feats)>2 else 0)
-        color = "artist_genres_list:N" if "artist_genres_list" in dff_plot.columns else None
-        dfp = explode_genres(dff_plot) if color else dff_plot
+        color = "artist_genres_list:N" if "artist_genres_list" in dff_chart.columns else None
+        dfp = explode_genres(dff_chart) if color else dff_chart
         scatter = alt.Chart(dfp.dropna(subset=[x,y])).mark_circle(opacity=0.4).encode(
             x=f"{x}:Q", y=f"{y}:Q", color=color, tooltip=[x,y]
         ).properties(height=420)
@@ -754,36 +828,45 @@ with tabs[6]:
 with tabs[7]:
     st.subheader("PCA (2D)")
     st.markdown("Reduces many features into **two components** so you can see **clusters**. Toggle in the sidebar to run.")
-    if run_pca:
-        feats = [c for c in ["acousticness","danceability","energy","instrumentalness",
-                             "liveness","loudness","speechiness","tempo","valence"]
-                 if c in dff_plot.columns]
-        if len(feats) >= 2:
-            X = dff_plot[feats].dropna()
-            if len(X) > 10:
-                scaler = StandardScaler()
-                Xs = scaler.fit_transform(X.values)
-                pca = PCA(n_components=2)
-                comps = pca.fit_transform(Xs)
-                pca_df = pd.DataFrame(comps, columns=["PC1","PC2"])
-                if "artist_genres_list" in dff_plot.columns:
-                    ex = explode_genres(dff_plot.loc[X.index])
-                    pca_df = pca_df.iloc[:len(ex)]
-                    pca_df["genre"] = ex["artist_genres_list"].values[:len(pca_df)]
-                    color = "genre:N"
+    if enable_pca:
+        if not lazy_heavy or st.button("Compute PCA", key="compute_pca"):
+            with st.spinner("Computing PCA..."):
+                feats = [c for c in ["acousticness","danceability","energy","instrumentalness",
+                                     "liveness","loudness","speechiness","tempo","valence"]
+                         if c in dff_chart.columns]
+                if len(feats) >= 2:
+                    X = dff_chart[feats].dropna()
+                    if len(X) > 10:
+                        scaler = StandardScaler()
+                        Xs = scaler.fit_transform(X.values)
+                        pca = PCA(n_components=2)
+                        comps = pca.fit_transform(Xs)
+                        pca_df = pd.DataFrame(comps, columns=["PC1","PC2"])
+                        if "artist_genres_list" in dff_chart.columns:
+                            ex = explode_genres(dff_chart.loc[X.index])
+                            pca_df = pca_df.iloc[:len(ex)]
+                            pca_df["genre"] = ex["artist_genres_list"].values[:len(pca_df)]
+                            color = "genre:N"
+                        else:
+                            color = alt.value("steelblue")
+                        expl = (pca.explained_variance_ratio_ * 100).round(1)
+                        scatter = alt.Chart(pca_df).mark_circle(opacity=0.5).encode(
+                            x=alt.X("PC1:Q", title=f"PC1 ({expl[0]}%)"),
+                            y=alt.Y("PC2:Q", title=f"PC2 ({expl[1]}%)"),
+                            color=color
+                        ).properties(height=420)
+                        st.altair_chart(scatter, use_container_width=True)
+                        
+                        # Memory cleanup
+                        if enable_gc:
+                            del X, Xs, comps, pca_df, ex
+                            gc.collect()
+                    else:
+                        st.info("Not enough complete rows for PCA.")
                 else:
-                    color = alt.value("steelblue")
-                expl = (pca.explained_variance_ratio_ * 100).round(1)
-                scatter = alt.Chart(pca_df).mark_circle(opacity=0.5).encode(
-                    x=alt.X("PC1:Q", title=f"PC1 ({expl[0]}%)"),
-                    y=alt.Y("PC2:Q", title=f"PC2 ({expl[1]}%)"),
-                    color=color
-                ).properties(height=420)
-                st.altair_chart(scatter, use_container_width=True)
-            else:
-                st.info("Not enough complete rows for PCA.")
+                    st.info("Need at least two feature columns.")
         else:
-            st.info("Need at least two feature columns.")
+            st.caption("Lazy compute is ON — click the button above to compute PCA.")
     else:
         st.caption("Enable PCA from the sidebar to compute (on sampled data if Fast mode is on).")
 
@@ -792,8 +875,8 @@ with tabs[8]:
     st.subheader("Mood Landscape (Valence × Energy)")
     st.markdown("Instead of dots, we **bin** plays into a grid so dense areas stand out. Color shows **play density**; optional overlay shows **avg danceability**.")
 
-    if {"valence","energy"}.issubset(dff_plot.columns):
-        dfp = dff_plot.copy()
+    if {"valence","energy"}.issubset(dff_chart.columns):
+        dfp = dff_chart.copy()
         # Optional: facet by top genre to break ties visually
         facet = st.checkbox("Facet by top genre (optional)", value=False)
         if "artist_genres_list" in dfp.columns:
@@ -802,11 +885,11 @@ with tabs[8]:
             dfp_ex = dfp
             dfp_ex["artist_genres_list"] = None
 
-        # Build 2D binned heatmap
+        # Build 2D binned heatmap with optimized binning
         base = alt.Chart(dfp_ex.dropna(subset=["valence","energy"])).transform_bin(
-            ["val_bin", "valence"], field="valence", bin=alt.Bin(maxbins=24)
+            ["val_bin", "valence"], field="valence", bin=alt.Bin(maxbins=20)  # Reduced bins for performance
         ).transform_bin(
-            ["eng_bin", "energy"], field="energy", bin=alt.Bin(maxbins=24)
+            ["eng_bin", "energy"], field="energy", bin=alt.Bin(maxbins=20)  # Reduced bins for performance
         ).transform_aggregate(
             count="count()", avg_danceability="mean(danceability)",
             groupby=["val_bin","eng_bin"] + (["artist_genres_list"] if facet else [])
@@ -832,6 +915,11 @@ with tabs[8]:
             heat = heat.facet(column=alt.Column("artist_genres_list:N", title=None, header=alt.Header(labelAngle=0)))
 
         st.altair_chart(heat.resolve_scale(color="independent"), use_container_width=True)
+        
+        # Memory cleanup
+        if enable_gc:
+            del dfp, dfp_ex
+            gc.collect()
     else:
         st.info("Missing valence/energy columns.")
 
@@ -881,35 +969,45 @@ with tabs[10]:
     st.subheader("Listening Sessions")
     st.markdown("Reconstruct sessions using a **time gap** (default 30 minutes). Toggle clustering to label sessions by **mood**.")
     if enable_sessions:
-        sess = build_sessions(dff, gap_minutes=gap_mins)
-        if not sess.empty:
-            st.markdown("**Session sizes and durations:**")
-            sdist = sess[["plays","duration_min"]].describe().round(2)
-            st.dataframe(sdist)
+        if not lazy_heavy or st.button("Compute Sessions", key="compute_sessions"):
+            with st.spinner("Building sessions..."):
+                sess = build_sessions(dff, gap_minutes=gap_mins)
+                if not sess.empty:
+                    st.markdown("**Session sizes and durations:**")
+                    sdist = sess[["plays","duration_min"]].describe().round(2)
+                    st.dataframe(sdist)
 
-            st.markdown("**Sessions over time (count):**")
-            if "date" in sess.columns:
-                scount = sess.groupby("date", as_index=False).size().rename(columns={"size":"sessions"})
-                line = alt.Chart(scount).mark_line(point=True).encode(x="date:T", y="sessions:Q").properties(height=260)
-                st.altair_chart(line, use_container_width=True)
+                    st.markdown("**Sessions over time (count):**")
+                    if "date" in sess.columns:
+                        scount = sess.groupby("date", as_index=False).size().rename(columns={"size":"sessions"})
+                        line = alt.Chart(scount).mark_line(point=True).encode(x="date:T", y="sessions:Q").properties(height=260)
+                        st.altair_chart(line, use_container_width=True)
 
-            if len(sess) > 10:
-                st.markdown("**Average session mood (energy vs valence):**")
-                scatter = alt.Chart(sess.dropna(subset=["energy_mean","valence_mean"])).mark_circle(opacity=0.5).encode(
-                    x="valence_mean:Q", y="energy_mean:Q", size="plays:Q", tooltip=["plays","duration_min","valence_mean","energy_mean"]
-                ).properties(height=340)
-                st.altair_chart(scatter, use_container_width=True)
+                    if len(sess) > 10:
+                        st.markdown("**Average session mood (energy vs valence):**")
+                        scatter = alt.Chart(sess.dropna(subset=["energy_mean","valence_mean"])).mark_circle(opacity=0.5).encode(
+                            x="valence_mean:Q", y="energy_mean:Q", size="plays:Q", tooltip=["plays","duration_min","valence_mean","energy_mean"]
+                        ).properties(height=340)
+                        st.altair_chart(scatter, use_container_width=True)
 
-            st.markdown("**Cluster Sessions (MiniBatchKMeans):**")
-            cs = cluster_sessions(sess, k=k_clusters)
-            if not cs.empty:
-                cbar = alt.Chart(cs).mark_bar().encode(
-                    x="count():Q", y=alt.Y("session_label:N", sort="-x"), tooltip=["count()"]
-                ).properties(height=260, title="Session clusters")
-                st.altair_chart(cbar, use_container_width=True)
-                st.dataframe(cs[["session_id","session_label","plays","duration_min","energy_mean","valence_mean","danceability_mean"]].head(50))
-            else:
-                st.info("Not enough data to cluster sessions (need mood features).")
+                    st.markdown("**Cluster Sessions (MiniBatchKMeans):**")
+                    with st.spinner("Clustering sessions..."):
+                        cs = cluster_sessions(sess, k=k_clusters)
+                        if not cs.empty:
+                            cbar = alt.Chart(cs).mark_bar().encode(
+                                x="count():Q", y=alt.Y("session_label:N", sort="-x"), tooltip=["count()"]
+                            ).properties(height=260, title="Session clusters")
+                            st.altair_chart(cbar, use_container_width=True)
+                            st.dataframe(cs[["session_id","session_label","plays","duration_min","energy_mean","valence_mean","danceability_mean"]].head(50))
+                        else:
+                            st.info("Not enough data to cluster sessions (need mood features).")
+                    
+                    # Memory cleanup
+                    if enable_gc:
+                        del sess, sdist, scount, cs
+                        gc.collect()
+        else:
+            st.caption("Lazy compute is ON — click the button above to compute sessions.")
     else:
         st.caption("Toggle 'Reconstruct & cluster sessions' in the sidebar to compute.")
 
@@ -972,4 +1070,21 @@ with tabs[12]:
     else:
         st.info("No forgotten tracks found under current settings/filters.")
 
-st.caption("This Fast+ build adds genre entropy, mood/energy maps, discovery metrics, sessions, personality, and nostalgia — all optimized with caching and sampling.")
+st.caption("🚀 **Ultra Fast Build**: Genre entropy, mood/energy maps, discovery metrics, sessions, personality, and nostalgia — all optimized with smart caching, lazy loading, memory management, and progressive computation.")
+
+# Performance monitoring
+if st.sidebar.checkbox("Show Performance Info", value=False):
+    st.sidebar.subheader("Performance Metrics")
+    st.sidebar.metric("Data Rows", f"{len(df):,}")
+    st.sidebar.metric("Filtered Rows", f"{len(dff):,}")
+    st.sidebar.metric("Plot Rows", f"{len(dff_plot):,}")
+    st.sidebar.metric("Chart Rows", f"{len(dff_chart):,}")
+    
+    # Memory usage estimation
+    memory_mb = df.memory_usage(deep=True).sum() / 1024 / 1024
+    st.sidebar.metric("Memory Usage (MB)", f"{memory_mb:.1f}")
+    
+    if st.sidebar.button("Clear Cache"):
+        st.cache_data.clear()
+        st.sidebar.success("Cache cleared!")
+        st.rerun()
