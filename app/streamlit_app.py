@@ -4,9 +4,6 @@ import pandas as pd
 import numpy as np
 import altair as alt
 from datetime import datetime, timedelta
-from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler
-from sklearn.cluster import MiniBatchKMeans
 import os
 import re
 import time
@@ -337,6 +334,11 @@ def cluster_sessions(sess: pd.DataFrame, k: int = 5) -> pd.DataFrame:
     feats = [c for c in ["energy_mean","valence_mean","danceability_mean","loudness_mean","tempo_mean"] if c in sess.columns]
     if len(feats) < 2 or len(sess) < k:
         return pd.DataFrame()
+    try:
+        from sklearn.cluster import MiniBatchKMeans
+    except ImportError:
+        st.warning("Install scikit-learn to enable session clustering (pip install scikit-learn).")
+        return pd.DataFrame()
     X = sess[feats].fillna(sess[feats].mean())
     km = MiniBatchKMeans(n_clusters=k, random_state=42, batch_size=512, n_init="auto")
     labels = km.fit_predict(X)
@@ -442,8 +444,10 @@ gap_mins = st.sidebar.slider("Session gap threshold (minutes)", 10, 60, 30, 5)
 # Date range
 if "date" in df.columns:
     dates = df["date"]
-    if not np.issubdtype(dates.dtype, np.datetime64):
+    if not pd.api.types.is_datetime64_any_dtype(dates):
         dates = pd.to_datetime(dates)
+    if getattr(dates.dtype, "tz", None) is not None:
+        dates = dates.dt.tz_localize(None)
     min_date = dates.min()
     max_date = dates.max()
     dr = st.sidebar.date_input("Date range", (min_date, max_date))
@@ -478,8 +482,10 @@ selected_countries = st.sidebar.multiselect("Countries", options=countries, defa
 mask = np.ones(len(df), dtype=bool)
 if start and end and "date" in df.columns:
     dates = df["date"]
-    if not np.issubdtype(dates.dtype, np.datetime64):
+    if not pd.api.types.is_datetime64_any_dtype(dates):
         dates = pd.to_datetime(dates)
+    if getattr(dates.dtype, "tz", None) is not None:
+        dates = dates.dt.tz_localize(None)
     date_mask = (dates >= pd.to_datetime(start)) & (dates <= pd.to_datetime(end))
     mask &= date_mask.to_numpy()
 if selected_genres and "artist_genres_list" in df.columns:
@@ -816,7 +822,16 @@ with tabs[6]:
             era_b = st.date_input("Date range B", (pd.to_datetime(dff["date"]).quantile(0.5), pd.to_datetime(dff["date"]).max()))
         def _corr_range(r):
             if isinstance(r, (list, tuple)) and len(r)==2:
-                m = (pd.to_datetime(dff["date"]) >= pd.to_datetime(r[0])) & (pd.to_datetime(dff["date"]) <= pd.to_datetime(r[1]))
+                dates = pd.to_datetime(dff["date"])
+                if getattr(dates.dtype, "tz", None) is not None:
+                    dates = dates.dt.tz_localize(None)
+                start_dt = pd.to_datetime(r[0])
+                end_dt = pd.to_datetime(r[1])
+                if getattr(start_dt, "tzinfo", None) is not None:
+                    start_dt = start_dt.tz_localize(None)
+                if getattr(end_dt, "tzinfo", None) is not None:
+                    end_dt = end_dt.tz_localize(None)
+                m = (dates >= start_dt) & (dates <= end_dt)
                 sub = dff.loc[m, feats].dropna()
                 return sub.corr()
             return None
@@ -843,9 +858,16 @@ with tabs[7]:
     if enable_pca:
         if not lazy_heavy or st.button("Compute PCA", key="compute_pca"):
             with st.spinner("Computing PCA..."):
-                feats = [c for c in ["acousticness","danceability","energy","instrumentalness",
-                                     "liveness","loudness","speechiness","tempo","valence"]
-                         if c in dff_chart.columns]
+                feats = []
+                try:
+                    from sklearn.decomposition import PCA
+                    from sklearn.preprocessing import StandardScaler
+                except ImportError:
+                    st.warning("Install scikit-learn to run PCA (pip install scikit-learn).")
+                else:
+                    feats = [c for c in ["acousticness","danceability","energy","instrumentalness",
+                                         "liveness","loudness","speechiness","tempo","valence"]
+                             if c in dff_chart.columns]
                 if len(feats) >= 2:
                     X = dff_chart[feats].dropna()
                     if len(X) > 10:
@@ -1046,7 +1068,16 @@ with tabs[11]:
                 era_b_fp = st.date_input("Select Era B (fingerprint)", (pd.to_datetime(dff["date"]).quantile(0.5), pd.to_datetime(dff["date"]).max()))
             def avg_feats_rng(rng):
                 if isinstance(rng, (list, tuple)) and len(rng)==2:
-                    m = (pd.to_datetime(dff["date"]) >= pd.to_datetime(rng[0])) & (pd.to_datetime(dff["date"]) <= pd.to_datetime(rng[1]))
+                    dates = pd.to_datetime(dff["date"])
+                    if getattr(dates.dtype, "tz", None) is not None:
+                        dates = dates.dt.tz_localize(None)
+                    start_dt = pd.to_datetime(rng[0])
+                    end_dt = pd.to_datetime(rng[1])
+                    if getattr(start_dt, "tzinfo", None) is not None:
+                        start_dt = start_dt.tz_localize(None)
+                    if getattr(end_dt, "tzinfo", None) is not None:
+                        end_dt = end_dt.tz_localize(None)
+                    m = (dates >= start_dt) & (dates <= end_dt)
                     return dff.loc[m, feats_fp].mean()
                 return None
             a_fp = avg_feats_rng(era_a_fp)
