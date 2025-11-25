@@ -168,19 +168,21 @@ def optimize(df: pd.DataFrame) -> pd.DataFrame:
                 "tempo", "valence"]
     for c in num_cols:
         if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce", downcast="float")
+            downcast = "integer" if c == "ms_played" else "float"
+            df[c] = pd.to_numeric(df[c], errors="coerce", downcast=downcast)
 
     # Add stable row_id for fast joins
     df["row_id"] = np.arange(len(df), dtype="int32")  # Use int32 instead of int64
 
     # Time features with optimization
     if "ts" in df.columns:
-        df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
-        df["date"] = df["ts"].dt.date
-        df["year"] = df["ts"].dt.year.astype("int16")  # Use int16 for years
-        df["month"] = df["ts"].dt.to_period("M").astype(str)
-        df["hour"] = df["ts"].dt.hour.astype("int8")  # Use int8 for hours
-        df["dow"] = df["ts"].dt.day_name()
+        ts = pd.to_datetime(df["ts"], errors="coerce")
+        df["ts"] = ts
+        df["date"] = ts.dt.floor("D")  # keep as datetime64 for cheaper comparisons
+        df["year"] = ts.dt.year.astype("int16")  # Use int16 for years
+        df["month"] = ts.dt.to_period("M").astype(str)
+        df["hour"] = ts.dt.hour.astype("int8")  # Use int8 for hours
+        df["dow"] = ts.dt.day_name()
 
     # Categoricals with memory optimization
     categorical_cols = ["master_metadata_album_artist_name","master_metadata_track_name",
@@ -200,14 +202,10 @@ def optimize(df: pd.DataFrame) -> pd.DataFrame:
 
     # Genres list with optimization
     if "artist_genres" in df.columns:
-        def split_genres(x):
-            if pd.isna(x): return []
-            s = str(x)
-            for d in ["|",";","||"," / ",","]:
-                if d in s:
-                    return [p.strip() for p in s.split(d) if p.strip()]
-            return [s.strip()] if s.strip() else []
-        df["artist_genres_list"] = df["artist_genres"].apply(split_genres)
+        # Vectorized split keeps parsing fast even on large files
+        splits = (df["artist_genres"].fillna("").astype(str)
+                  .str.split(r"\s*(?:\|\|?|;|/|,)\s*", regex=True))
+        df["artist_genres_list"] = splits.apply(lambda lst: [p for p in lst if p])
     
     # Force garbage collection
     gc.collect()
@@ -247,6 +245,11 @@ def build_exploded_all(df: pd.DataFrame) -> pd.DataFrame:
     exp["ms_played"] = exp["ms_played"].astype("float32")
     
     return exp
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def get_exploded_all_cached(df: pd.DataFrame) -> pd.DataFrame:
+    """Lazy wrapper so we only build the explosion when a chart needs it."""
+    return build_exploded_all(df)
 
 @st.cache_data(show_spinner=False, ttl=1800)  # Cache for 30 minutes
 def get_exploded_for_filter(dff: pd.DataFrame, exploded_all: pd.DataFrame) -> pd.DataFrame:
@@ -409,13 +412,10 @@ def load_and_prepare_data():
     with st.spinner("Optimizing data types and preprocessing..."):
         df = optimize(df_raw)
     
-    with st.spinner("Building genre explosion cache..."):
-        exp_all = build_exploded_all(df)
-    
-    return df, exp_all
+    return df
 
 # Load data with progress indicators
-df, exp_all = load_and_prepare_data()
+df = load_and_prepare_data()
 
 artist_col = "master_metadata_album_artist_name" if "master_metadata_album_artist_name" in df.columns else None
 track_col = "master_metadata_track_name" if "master_metadata_track_name" in df.columns else None
@@ -441,8 +441,11 @@ gap_mins = st.sidebar.slider("Session gap threshold (minutes)", 10, 60, 30, 5)
 
 # Date range
 if "date" in df.columns:
-    min_date = pd.to_datetime(df["date"]).min()
-    max_date = pd.to_datetime(df["date"]).max()
+    dates = df["date"]
+    if not np.issubdtype(dates.dtype, np.datetime64):
+        dates = pd.to_datetime(dates)
+    min_date = dates.min()
+    max_date = dates.max()
     dr = st.sidebar.date_input("Date range", (min_date, max_date))
     if isinstance(dr, (list, tuple)) and len(dr) == 2:
         start, end = dr
@@ -472,19 +475,27 @@ countries = sorted(df["conn_country"].dropna().unique()) if "conn_country" in df
 selected_countries = st.sidebar.multiselect("Countries", options=countries, default=[])
 
 # ---------------------- FILTER ----------------------
-mask = pd.Series(True, index=df.index)
+mask = np.ones(len(df), dtype=bool)
 if start and end and "date" in df.columns:
-    mask &= (pd.to_datetime(df["date"]) >= pd.to_datetime(start)) & (pd.to_datetime(df["date"]) <= pd.to_datetime(end))
+    dates = df["date"]
+    if not np.issubdtype(dates.dtype, np.datetime64):
+        dates = pd.to_datetime(dates)
+    date_mask = (dates >= pd.to_datetime(start)) & (dates <= pd.to_datetime(end))
+    mask &= date_mask.to_numpy()
 if selected_genres and "artist_genres_list" in df.columns:
-    mask &= df["artist_genres_list"].apply(lambda lst: any(g in selected_genres for g in lst) if isinstance(lst, list) else False)
+    selected_genre_set = set(selected_genres)
+    genre_mask = df["artist_genres_list"].apply(
+        lambda lst: bool(selected_genre_set.intersection(lst)) if isinstance(lst, (list, tuple)) else False
+    ).to_numpy()
+    mask &= genre_mask
 if selected_artists and artist_col is not None:
-    mask &= df[artist_col].isin(selected_artists)
+    mask &= df[artist_col].isin(selected_artists).to_numpy()
 if selected_platforms and "platform_norm" in df.columns:
-    mask &= df["platform_norm"].isin(selected_platforms)
+    mask &= df["platform_norm"].isin(selected_platforms).to_numpy()
 if selected_countries and "conn_country" in df.columns:
-    mask &= df["conn_country"].isin(selected_countries)
+    mask &= df["conn_country"].isin(selected_countries).to_numpy()
 
-dff = df[mask].copy()
+dff = df.loc[mask].copy()
 
 # Decide sampled frame for heavy charts with memory optimization
 if fast_mode and len(dff) > MAX_ROWS:
@@ -542,6 +553,7 @@ with tabs[1]:
 
     if not lazy_heavy or st.button("Compute Genre Stack / Entropy", key="compute_genres"):
         with st.spinner("Computing genre analysis..."):
+            exp_all = get_exploded_all_cached(df)
             exploded = get_exploded_for_filter(dff_plot, exp_all)
             if exploded.empty:
                 st.info("No genre data in the current filter.")
